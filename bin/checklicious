@@ -1,0 +1,240 @@
+#! /usr/bin/env perl
+
+package myUA;
+
+use strict;
+use warnings;
+
+use Exporter();
+use LWP::Parallel::UserAgent qw(:CALLBACK);
+
+use vars qw(@ISA @EXPORT);
+
+@ISA = qw(LWP::Parallel::UserAgent Exporter);
+@EXPORT = @LWP::Parallel::UserAgent::EXPORT_OK;
+
+sub on_failure {
+	my ($self, $request, $response, $entry) = @_;
+
+	$response->{_fail} = 1;
+}
+
+sub on_return {
+	my ($self, $request, $response, $entry) = @_;
+
+	$response->{_fail} = 1 if (!$response->is_success);
+}
+
+package main;
+
+eval 'exec /usr/bin/env perl -S $0 ${1+"$@"}' if 0;
+
+use strict;
+use warnings;
+
+use Carp;
+use Getopt::Long;
+use Net::Delicious;
+use Pod::Usage;
+
+use vars qw($VERSION);
+$VERSION = 0.01;
+
+my %args;
+my @tags = ();
+my $help = 0;
+my $man = 0;
+my $verbose = 0;
+
+my $count = 0;
+my @broken = ();
+my @redirect = ();
+
+sub logging {
+	print shift if $verbose;
+}
+
+sub init {
+	$SIG{PIPE} = 'IGNORE';
+
+	if (open(CONFIG, "< $ENV{HOME}/.checkliciousrc")) {
+		&logging("Reading config\n");
+
+		while (<CONFIG>) {
+			chomp;
+			s/#.*$//;
+
+			next unless m/^\s*([a-z_]+)=(.+)\s*$/io;
+			$args{$1} = $2;
+		}
+
+		close(CONFIG);
+	}
+
+	GetOptions(
+		'help|?'	=> \$help,
+		'man'		=> \$man,
+		'user=s'	=> sub { $args{$_[0]} = $_[1]; },
+		'pswd=s'	=> sub { $args{$_[0]} = $_[1]; },
+		'tag=s'		=> \@tags,
+		'all'		=> \$args{all},
+		'verbose'	=> \$verbose,
+		'debug'		=> sub { require LWP::Debug; LWP::Debug::level('+'); $args{debug} = 1; },
+	) or pod2usage(2);
+
+	@tags = split(/,/, join(',', @tags));
+	$args{threads} ||= 16;
+
+	pod2usage(1) if $help;
+	pod2usage(-exitstatus => 0, -verbose => 2) if $man;
+}
+
+sub callback {
+	no strict 'subs';
+	return C_ENDCON;
+}
+
+sub check {
+	# log into del.icio.us
+	&logging(sprintf("Logging into del.icio.us as user %s\n", $args{user}));
+	my $del = Net::Delicious->new(\%args)
+		or croak 'Unable to create net::Delicious';
+
+	# get bookmarks
+	my @bookmarks;
+	if (defined($args{all}) and ($args{all} == 1)) {
+		@bookmarks = $del->all_posts();
+	}
+	else {
+		map { push @bookmarks, $del->all_posts_for_tag( { tag => $_ } ) } @tags;
+	}
+
+	$count = $#bookmarks + 1;
+
+	# create bot
+	my $pua = myUA->new()
+		or croak 'Unable to create LWP::Parallel::UserAgent';
+	$pua->duplicates(1);	# 1 means ignore duplicates
+	$pua->redirect(1);		# 1 means allow redirect
+	$pua->max_hosts($args{threads});
+	$pua->max_req($args{threads});
+
+	# register urls
+	map { $pua->register(HTTP::Request->new('GET', $_->href), \&callback); } @bookmarks;
+	my $entries = $pua->wait();
+
+	# process result
+	foreach (keys %$entries) {
+		my $res = $entries->{$_}->response;
+
+		if ($res->is_success) {
+			&logging(sprintf("Checking %s OK\n", $res->request->uri));
+		}
+
+		if (defined($res->previous)) {
+			my $ori = $res;
+			do { $ori = $ori->previous; } while ($ori->previous);
+
+			&logging(sprintf("Redirect %s => %s\n", $ori->request->uri, $res->request->uri));
+
+			push @redirect, [$ori->request->uri, $res->request->uri];
+		}
+
+		push @broken, $res->request->uri if (defined($res->{_fail}) and ($res->{_fail} == 1));
+	}
+}
+
+sub report {
+	printf "Total %d URLs, %d broken, %d redirected\n",
+		$count,
+		$#broken+1,
+		$#redirect+1;
+
+	print "\nBroken URLs:\n" if ($#broken != -1);
+	print join("\n", @broken)."\n";
+
+	print "\nRedirect URLs:\n" if ($#redirect != -1);
+	map { printf "%s ==> %s\n", $_->[0], $_->[1]; } @redirect;
+}
+
+sub main {
+	&init();
+	&check();
+	&report();
+}
+
+&main();
+
+__END__
+
+=head1 NAME
+
+checklicious - Check the validity of del.icio.us bookmarks
+
+=head1 SYNOPSIS
+
+checklicious [options]
+
+=head1 DESCRIPTION
+
+Checks your del.icio.us bookmarks and see if they are valid or not.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--help|-h|-?>
+
+Print a brief help message and exits.
+
+=item B<--man>
+
+Prints the manual page and exits.
+
+=item B<--verbose|-v>
+
+Prints verbose messages.
+
+=item B<--debug|-d>
+
+Prints debug messages, developers only.
+
+=item B<--user> <id>
+
+del.icio.us user id.
+
+=item B<--pswd> <password>
+
+del.icio.us user password.
+
+=item B<--all|-a>
+
+Checks all bookmarks.
+
+=item B<--tag|-t> <tag>
+
+Checks bookmarks which are tagged with C<tag>. Multiple C<--tag> options can
+be given, or you can just put them all into a single comma-separated list.
+
+=back
+
+=head1 CONFIGURATION
+
+To avoid having to remember user id and password (or tags list), default
+values will be read from C<$HOME/.checkliciousrc> if it exists. Any field
+defined there can, of course, be overridden on the command line. For example:
+
+    # my config at $HOME/.checklicious
+    user=blah
+    pswd=blah
+    tag=tag1,tag2
+
+=head1 AUTHOR
+
+Ying-Chieh Liao, L<ijliao@csie.nctu.edu.tw>
+
+=head1 SEE ALSO
+
+http://del.icio.us/
+
+=cut
